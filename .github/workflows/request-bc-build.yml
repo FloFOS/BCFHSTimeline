@@ -9,6 +9,28 @@ on:
         default: 50100
 
 jobs:
+  security-check:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      allowed: ${{ steps.final-check.outputs.allowed }}
+    
+    steps:
+    - name: Security check
+      run: |
+        echo "🔒 SECURITY CHECK"
+        echo "📍 Branch: ${{ github.ref }}"
+        echo "👤 User: ${{ github.actor }}"
+        echo "📦 Repo: ${{ github.repository }}"
+        
+        # Check branch
+        if [[ "${{ github.ref }}" != "refs/heads/main" ]]; then
+          echo "❌ ERROR: Workflow allowed only on main"
+          exit 1
+        fi
+        
+        echo "✅ Security check passed"
+  
   validate-and-trigger:
     runs-on: ubuntu-latest
     env:
