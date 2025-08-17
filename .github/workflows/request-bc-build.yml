@@ -1,0 +1,161 @@
+name: Build Extension BC Request
+on:
+  workflow_dispatch:
+    inputs:
+      start_id:
+        description: 'Range start ID (ex: 50100)'
+        required: true
+        type: number
+        default: 50100
+
+jobs:
+  validate-and-trigger:
+    runs-on: ubuntu-latest
+    env:
+      # Nb max objects in extension
+      OBJECTS_COUNT: 20
+    
+    steps:
+    - name: Get Latest Version from Private Repo
+      id: get-version
+      run: |
+        echo "🔍 Getting latest version from private repository..."
+        
+        # Get latest tag from private repo using GitHub API
+        LATEST_VERSION=$(curl -s \
+          -H "Authorization: token ${{ secrets.PAT_PRIVATE_REPO }}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/repos/FloFOS/BCTimelineSource/releases/latest" | jq -r '.tag_name')
+        
+        # Fallback: if no release exists, get latest tag directly
+        if [[ "$LATEST_VERSION" == "null" || -z "$LATEST_VERSION" ]]; then
+          echo "⚠️ No release found, checking for latest tag..."
+          LATEST_VERSION=$(curl -s \
+            -H "Authorization: token ${{ secrets.PAT_PRIVATE_REPO }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/FloFOS/BCTimelineSource/tags" | jq -r '.[0].name')
+        fi
+        
+        # If still no version, use default
+        if [[ "$LATEST_VERSION" == "null" || -z "$LATEST_VERSION" ]]; then
+          LATEST_VERSION="v1.0.0"
+          echo "❌ No tags found"
+          exit 1
+        else
+          echo "✅ Found latest version: $LATEST_VERSION"
+        fi
+        
+        echo "version=$LATEST_VERSION" >> $GITHUB_OUTPUT
+
+    - name: Compute and check Range
+      id: calculate-range
+      env:
+        START_ID: ${{ inputs.start_id }}
+        VERSION: ${{ steps.get-version.outputs.version }}
+      run: |
+        # Auto compute ending range
+        END_ID=$((START_ID + OBJECTS_COUNT - 1))
+        
+        echo "start_id=$START_ID" >> $GITHUB_OUTPUT
+        echo "end_id=$END_ID" >> $GITHUB_OUTPUT
+        echo "objects_count=$OBJECTS_COUNT" >> $GITHUB_OUTPUT
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        
+        # Check Business Central per-tenant range
+        if [[ $START_ID -lt 50000 || $START_ID -gt (99999 - OBJECTS_COUNT + 1) ]]; then
+          echo "❌ Starting ID range invalid. Must be between 50000-$((99999 - OBJECTS_COUNT + 1))"
+          exit 1
+        fi
+        
+        if [[ $END_ID -gt 99999 ]]; then
+          echo "❌ Computed range up to 99999. Ending ID : $END_ID"
+          echo "💡 Try with a smaller start ID (max: $((99999 - OBJECTS_COUNT + 1)))"
+          exit 1
+        fi
+        
+        echo "✅ Validated range: $START_ID-$END_ID ($OBJECTS_COUNT objects)"
+        echo "✅ App version: $VERSION"
+
+    - name: Check Existing Release
+      id: check-existing
+      env:
+        START_ID: ${{ steps.calculate-range.outputs.start_id }}
+        VERSION: ${{ steps.calculate-range.outputs.version }}
+      run: |
+        # Create build tag with version and range
+        BUILD_TAG="${VERSION}-range-${START_ID}"
+        echo "build_tag=$BUILD_TAG" >> $GITHUB_OUTPUT
+        
+        # Check if release already exists
+        if gh release view "$BUILD_TAG" >/dev/null 2>&1; then
+          echo "exists=true" >> $GITHUB_OUTPUT
+          echo "🔍 Build already exists: $BUILD_TAG"
+          echo "📦 Download here: $(gh release view $BUILD_TAG --json url -q .url)"
+          exit 1
+        else
+          echo "exists=false" >> $GITHUB_OUTPUT
+          echo "🆕 New build required: $BUILD_TAG"
+        fi
+      env:
+        GH_TOKEN: ${{ github.token }}
+
+    - name: Run Build AL-Go
+      if: steps.check-existing.outputs.exists == 'false'
+      uses: peter-evans/repository-dispatch@v3
+      with:
+        token: ${{ secrets.PAT_PRIVATE_REPO }}
+        repository: 'FloFOS/BCTimelineSource'
+        event-type: 'build-with-range'
+        client-payload: |
+          {
+            "start_id": ${{ steps.calculate-range.outputs.start_id }},
+            "end_id": ${{ steps.calculate-range.outputs.end_id }},
+            "objects_count": ${{ steps.calculate-range.outputs.objects_count }},
+            "version": "${{ steps.calculate-range.outputs.version }}",
+            "build_tag": "${{ steps.check-existing.outputs.build_tag }}",
+            "source_repo": "${{ github.repository }}",
+            "triggered_by": "${{ github.actor }}"
+          }
+
+    - name: Create Follow-up Issue
+      if: steps.check-existing.outputs.exists == 'false'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          await github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: `🔨 Build running - ${{ steps.calculate-range.outputs.version }} Range ${{ steps.calculate-range.outputs.start_id }}-${{ steps.calculate-range.outputs.end_id }}`,
+            body: `
+            ## Business Central Extension - Build Asked
+            
+            **Setup:**
+            - App Version: \`${{ steps.calculate-range.outputs.version }}\`
+            - Range ID: \`${{ steps.calculate-range.outputs.start_id }}-${{ steps.calculate-range.outputs.end_id }}\`
+            - Objects count: \`${{ steps.calculate-range.outputs.objects_count }}\`
+            - Tag: \`${{ steps.check-existing.outputs.build_tag }}\`
+            - Asked by: @${{ github.actor }}
+            
+            **Status:** ⏳ Build running with AL-Go...
+            
+            Release will be available automatically once the build is complete.
+            
+            **Expected filename:** \`BCTimeline_${{ steps.calculate-range.outputs.version }}_range_${{ steps.calculate-range.outputs.start_id }}-${{ steps.calculate-range.outputs.end_id }}.app\`
+            `,
+            labels: ['build-request', 'al-go-build', 'in-progress', '${{ steps.calculate-range.outputs.version }}']
+          });
+
+    - name: Show result
+      run: |
+        if [[ "${{ steps.check-existing.outputs.exists }}" == "true" ]]; then
+          echo "✅ Extension already available!"
+          echo "🏷️ Tag: ${{ steps.check-existing.outputs.build_tag }}"
+          echo "📱 Version: ${{ steps.calculate-range.outputs.version }}"
+          echo "📥 Download: https://github.com/${{ github.repository }}/releases/tag/${{ steps.check-existing.outputs.build_tag }}"
+        else
+          echo "🚀 Build running with AL-Go!"
+          echo "📱 Version: ${{ steps.calculate-range.outputs.version }}"
+          echo "🎯 Range: ${{ steps.calculate-range.outputs.start_id }}-${{ steps.calculate-range.outputs.end_id }}"
+          echo "🏷️ Build tag: ${{ steps.check-existing.outputs.build_tag }}"
+          echo "⏱️ Build running... Check the releases in a few minutes."
+        fi
